@@ -2,36 +2,32 @@
 """
 #author = will nyarko
 #file name = update_aspace.py
-#description = Updates ArchivesSpace agent records with SNAC ARK identifiers from the master_final_snac_arks.csv file.
-#note = This script modifies agent records by adding SNAC ARKs to agent_record_identifiers.
+#description = Update ArchivesSpace agent records with SNAC ARKs
 """
 
-import csv
 import json
-import os
-import sys
 import time
 import requests
 import logging
-import argparse
 import pandas as pd
+import os
+import sys
+import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Add project root to sys.path to fix module import
+# Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from src.config import ASPACE_CACHE_DIR, PROJECT_ROOT
 
 # Configuration paths
 CONFIG_PATH = "config.json"
-MASTER_CSV_PATH = "src/data/master_final_snac_arks.csv"
-UPDATED_CSV_PATH = "src/data/master_final_snac_arks_updated.csv"
-CACHE_DIR = ASPACE_CACHE_DIR
+MASTER_CSV_PATH = "src/data/master_spreadsheet.csv"
+ASPACE_CACHE_DIR = Path("../aspace-snac-agent-constellation-caches/aspace_cache")
 
 # Logging configuration
-LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOGS_DIR / "aspace_update_results.log"
+LOG_FILE = LOGS_DIR / "aspace_update.log"
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -40,15 +36,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Maximum number of retries for API calls
-MAX_RETRIES = 3
+# Also log to console
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
 
-def setup_argparse():
-    """Configure command line arguments."""
-    parser = argparse.ArgumentParser(description='Update ArchivesSpace agent records with SNAC ARKs')
-    parser.add_argument('--test', action='store_true', help='Run in test mode (only process 10 records)')
-    parser.add_argument('--batch-size', type=int, default=100, help='Number of records to process per batch')
-    parser.add_argument('--workers', type=int, default=5, help='Number of concurrent workers')
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Update ArchivesSpace agent records with SNAC ARKs")
+    parser.add_argument("--test", action="store_true", help="Run in test mode (process only a few records)")
+    parser.add_argument("--batch-size", type=int, default=50, help="Number of records to process per batch")
+    parser.add_argument("--workers", type=int, default=4, help="Number of concurrent worker threads")
+    parser.add_argument("--error-only", action="store_true", help="Only process records that had errors previously")
     return parser.parse_args()
 
 def load_config(config_path):
@@ -60,21 +59,16 @@ def authenticate(api_url, username, password):
     """Authenticate with the ArchivesSpace API and return session token."""
     login_endpoint = f"{api_url}/users/{username}/login"
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.post(login_endpoint, data={"password": password})
-            response.raise_for_status()
-            token = response.json().get("session")
-            if token:
-                return token
-            raise ValueError("Authentication failed: no session token returned.")
-        except (requests.exceptions.RequestException, ValueError) as e:
-            if attempt < MAX_RETRIES - 1:
-                logging.warning(f"Authentication attempt {attempt+1} failed: {str(e)}. Retrying...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logging.error(f"Authentication failed after {MAX_RETRIES} attempts: {str(e)}")
-                raise
+    try:
+        response = requests.post(login_endpoint, data={"password": password})
+        response.raise_for_status()
+        token = response.json().get("session")
+        if token:
+            return token
+        raise ValueError("Authentication failed: no session token returned.")
+    except Exception as e:
+        logging.error(f"Authentication failed: {str(e)}")
+        raise
 
 def get_agent_record(api_url, agent_uri, session_token):
     """Retrieve the agent record from ArchivesSpace."""
@@ -84,25 +78,22 @@ def get_agent_record(api_url, agent_uri, session_token):
     }
     url = f"{api_url}{agent_uri}"
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                logging.warning(f"GET attempt {attempt+1} failed for {agent_uri}: {str(e)}. Retrying...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logging.error(f"GET failed after {MAX_RETRIES} attempts for {agent_uri}: {str(e)}")
-                raise
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        error_msg = f"Error retrieving {agent_uri}: {str(e)}"
+        logging.error(error_msg)
+        raise Exception(error_msg)
 
 def update_agent_record(api_url, agent_uri, agent_data, snac_ark, session_token):
     """Update the agent record with SNAC ARK and save to ArchivesSpace."""
-    # Add SNAC ARK identifier if not already present
+    # Check if the SNAC ARK already exists
     snac_identifier_exists = False
     for identifier in agent_data.get('agent_record_identifiers', []):
-        if identifier.get('source') == 'snac' and identifier.get('record_identifier') == snac_ark:
+        if (identifier.get('source') == 'snac' or 
+            'snac' in identifier.get('record_identifier', '').lower()):
             snac_identifier_exists = True
             break
     
@@ -122,7 +113,6 @@ def update_agent_record(api_url, agent_uri, agent_data, snac_ark, session_token)
         agent_data['agent_record_identifiers'].append(new_identifier)
     else:
         # SNAC ARK already exists, no need to update
-        logging.info(f"SNAC ARK already exists for {agent_uri}: {snac_ark}")
         return "skipped", "SNAC ARK already exists"
     
     # Submit updated record
@@ -132,28 +122,37 @@ def update_agent_record(api_url, agent_uri, agent_data, snac_ark, session_token)
     }
     url = f"{api_url}{agent_uri}"
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.post(url, headers=headers, json=agent_data)
-            response.raise_for_status()
-            
-            # Return success and the record version
-            return "success", response.json().get('lock_version', 'unknown')
-        except requests.exceptions.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                logging.warning(f"UPDATE attempt {attempt+1} failed for {agent_uri}: {str(e)}. Retrying...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logging.error(f"UPDATE failed after {MAX_RETRIES} attempts for {agent_uri}: {str(e)}")
-                return "failure", str(e)
+    try:
+        response = requests.post(url, headers=headers, json=agent_data)
+        response.raise_for_status()
+        
+        # Return success status
+        return "success", response.json().get('lock_version', 'unknown')
+    except Exception as e:
+        error_msg = f"Error updating {agent_uri}: {str(e)}"
+        logging.error(error_msg)
+        return "failure", str(e)
 
-def process_record(row, api_url, session_token):
-    """Process a single record from the CSV file."""
+def process_record(args):
+    """Process a single record (for use with ThreadPoolExecutor)."""
+    row, api_url, session_token = args
     agent_uri = row['aspace_uri']
-    snac_ark = row['snac_ark_final']
     agent_name = row['agent_name']
     
-    logging.info(f"Processing {agent_uri} - {agent_name}")
+    # Find the SNAC ARK to use - prefer the final ARK
+    snac_ark = None
+    for col in ['snac_ark_final', 'snac_ark_new', 'snac_ark']:
+        if col in row and pd.notna(row[col]) and row[col]:
+            snac_ark = row[col]
+            break
+    
+    if not snac_ark:
+        return {
+            'aspace_uri': agent_uri,
+            'agent_name': agent_name,
+            'update_status': 'failure',
+            'message': 'No SNAC ARK found'
+        }
     
     try:
         # Get the current agent record
@@ -162,34 +161,114 @@ def process_record(row, api_url, session_token):
         # Update the agent record with SNAC ARK
         status, message = update_agent_record(api_url, agent_uri, agent_data, snac_ark, session_token)
         
-        if status == "success":
-            logging.info(f"Successfully updated {agent_uri} with SNAC ARK {snac_ark}")
-        elif status == "skipped":
-            logging.info(f"Skipped {agent_uri}: {message}")
+        if status == 'success':
+            logging.info(f"Successfully updated {agent_name} ({agent_uri}) with SNAC ARK {snac_ark}")
+        elif status == 'skipped':
+            logging.info(f"Skipped {agent_name} ({agent_uri}): {message}")
         else:
-            logging.error(f"Failed to update {agent_uri}: {message}")
+            logging.error(f"Failed to update {agent_name} ({agent_uri}): {message}")
         
         return {
             'aspace_uri': agent_uri,
             'agent_name': agent_name,
-            'snac_ark': snac_ark,
             'update_status': status,
             'message': message
         }
-        
+    
     except Exception as e:
-        logging.error(f"Exception processing {agent_uri}: {str(e)}")
+        logging.error(f"Exception processing {agent_name} ({agent_uri}): {str(e)}")
         return {
             'aspace_uri': agent_uri,
             'agent_name': agent_name,
-            'snac_ark': snac_ark,
             'update_status': 'failure',
             'message': str(e)
         }
 
+def update_aspace_records(api_url, session_token, df, batch_size=50, num_workers=4, test_mode=False):
+    """Update ArchivesSpace agent records with SNAC ARKs."""
+    # Add update_status column if it doesn't exist
+    if 'update_status' not in df.columns:
+        df['update_status'] = None
+    
+    # Filter out records that don't need updating
+    update_df = df[
+        # Only records with no update status or failed updates
+        ((df['update_status'].isna()) | (df['update_status'] == 'failure')) &
+        # And have a SNAC ARK
+        ((df['snac_ark_final'].notna()) | (df['snac_ark'].notna()))
+    ].copy()
+    
+    total_records = len(update_df)
+    
+    if test_mode:
+        # Limit to a small number of records for testing
+        update_df = update_df.head(10)
+        total_records = len(update_df)
+        logging.info(f"TEST MODE: Limited to {total_records} records")
+    
+    if total_records == 0:
+        logging.info("No records need updating")
+        return df
+    
+    logging.info(f"Updating {total_records} ArchivesSpace agent records")
+    
+    results = []
+    
+    # Process in batches to avoid overloading the API
+    for start_idx in range(0, total_records, batch_size):
+        end_idx = min(start_idx + batch_size, total_records)
+        batch_df = update_df.iloc[start_idx:end_idx]
+        
+        logging.info(f"Processing batch {start_idx//batch_size + 1}: records {start_idx+1}-{end_idx} of {total_records}")
+        
+        batch_results = []
+        
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(process_record, (row, api_url, session_token)): idx 
+                for idx, row in batch_df.iterrows()
+            }
+            
+            for future in as_completed(futures):
+                result = future.result()
+                batch_results.append(result)
+                
+                # Log progress
+                processed = len(batch_results)
+                print(f"Processed {processed}/{len(batch_df)} records in current batch", end='\r')
+        
+        results.extend(batch_results)
+        
+        # Refresh session token every batch to prevent timeouts
+        session_token = authenticate(api_url, username, password)
+    
+    print("\n")  # Clear the progress line
+    
+    # Update the original dataframe with results
+    for result in results:
+        agent_uri = result['aspace_uri']
+        mask = df['aspace_uri'] == agent_uri
+        
+        if any(mask):
+            df.loc[mask, 'update_status'] = result['update_status']
+    
+    # Calculate statistics
+    success_count = sum(1 for result in results if result['update_status'] == 'success')
+    skipped_count = sum(1 for result in results if result['update_status'] == 'skipped')
+    failure_count = sum(1 for result in results if result['update_status'] == 'failure')
+    
+    logging.info("\nUpdate Summary:")
+    logging.info(f"Total records processed: {len(results)}")
+    logging.info(f"Successfully updated: {success_count} ({success_count/len(results)*100:.1f}%)")
+    logging.info(f"Skipped (already updated): {skipped_count} ({skipped_count/len(results)*100:.1f}%)")
+    logging.info(f"Failed: {failure_count} ({failure_count/len(results)*100:.1f}%)")
+    
+    return df
+
 def main():
-    """Main function to run the update process."""
-    args = setup_argparse()
+    """Main function to update ArchivesSpace agent records."""
+    args = parse_args()
     
     # Load configuration
     config = load_config(CONFIG_PATH)
@@ -197,41 +276,23 @@ def main():
     api_url = aspace_creds["api_url"]
     username = aspace_creds["username"]
     password = aspace_creds["password"]
-    csv_encoding = config["settings"]["csv_encoding"]
-    batch_size = args.batch_size
+    csv_encoding = config["settings"].get("csv_encoding", "utf-8")
     
-    # Create cache directory if it doesn't exist
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Load master spreadsheet
+    try:
+        logging.info(f"Loading master spreadsheet from {MASTER_CSV_PATH}")
+        df = pd.read_csv(MASTER_CSV_PATH, encoding=csv_encoding)
+        logging.info(f"Loaded {len(df)} records from master spreadsheet")
+    except Exception as e:
+        logging.error(f"Error loading master spreadsheet: {str(e)}")
+        return 1
     
-    # Load and filter master CSV
-    logging.info("Loading and filtering master CSV file")
-    df = pd.read_csv(MASTER_CSV_PATH, encoding=csv_encoding)
-    
-    # Filter valid records
-    valid_records = df[
-        (df['aspace_error'] == False) & 
-        (df['snac_error'] == False) & 
-        (~df['snac_ark_final'].isna()) &
-        (df['snac_ark_final'].str.strip() != '')
-    ].copy()
-    
-    # Initialize update_status column if it doesn't exist
-    if 'update_status' not in valid_records.columns:
-        valid_records['update_status'] = ''
-    
-    # For test mode, only process a small number of records
-    if args.test:
-        valid_records = valid_records.head(10)
-        logging.info(f"TEST MODE: Processing only {len(valid_records)} records")
-    
-    total_records = len(valid_records)
-    if total_records == 0:
-        logging.warning("No valid records found for processing")
-        print("No valid records found for processing")
-        return
-    
-    logging.info(f"Found {total_records} valid records for processing")
-    print(f"Found {total_records} valid records for processing")
+    # Filter for error records if requested
+    if args.error_only and 'update_status' in df.columns:
+        df_to_process = df[df['update_status'] == 'failure'].copy()
+        logging.info(f"Filtered to {len(df_to_process)} records with previous update errors")
+    else:
+        df_to_process = df.copy()
     
     # Authenticate with ArchivesSpace API
     try:
@@ -240,77 +301,29 @@ def main():
         logging.info("Authentication successful")
     except Exception as e:
         logging.error(f"Authentication failed: {str(e)}")
-        print(f"Authentication failed: {str(e)}")
-        return
+        return 1
     
-    # Process records in batches
-    results = []
-    processed_count = 0
-    
-    for i in range(0, total_records, batch_size):
-        batch = valid_records.iloc[i:i+batch_size]
-        batch_start = i + 1
-        batch_end = min(i + batch_size, total_records)
+    # Update ArchivesSpace records
+    try:
+        updated_df = update_aspace_records(
+            api_url, 
+            session_token, 
+            df_to_process, 
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            test_mode=args.test
+        )
         
-        logging.info(f"Processing batch {i//batch_size + 1}: Records {batch_start}-{batch_end} of {total_records}")
-        print(f"Processing batch {i//batch_size + 1}: Records {batch_start}-{batch_end} of {total_records}")
+        # Save updated dataframe with status information
+        logging.info(f"Saving updated master spreadsheet")
+        updated_df.to_csv(MASTER_CSV_PATH, index=False, encoding=csv_encoding)
+        logging.info(f"Updated master spreadsheet saved to {MASTER_CSV_PATH}")
         
-        batch_results = []
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(process_record, row, api_url, session_token): idx 
-                for idx, row in batch.iterrows()
-            }
-            
-            for future in as_completed(futures):
-                batch_results.append(future.result())
-                processed_count += 1
-                if processed_count % 10 == 0 or processed_count == total_records:
-                    print(f"Processed {processed_count}/{total_records} records", end='\r')
-        
-        results.extend(batch_results)
-        
-        # Refresh session token every batch to prevent timeout
-        try:
-            session_token = authenticate(api_url, username, password)
-        except Exception as e:
-            logging.error(f"Re-authentication failed: {str(e)}")
-            print(f"Re-authentication failed: {str(e)}")
-            break
+        return 0
     
-    print("\n")  # Clear the progress line
-    
-    # Summarize results
-    success_count = sum(1 for result in results if result['update_status'] == 'success')
-    skipped_count = sum(1 for result in results if result['update_status'] == 'skipped')
-    failure_count = sum(1 for result in results if result['update_status'] == 'failure')
-    
-    logging.info("\nUpdate Summary:")
-    logging.info(f"Total records processed: {len(results)}")
-    logging.info(f"Successfully updated: {success_count}")
-    logging.info(f"Skipped (already updated): {skipped_count}")
-    logging.info(f"Failed to update: {failure_count}")
-    
-    print("\nUpdate Summary:")
-    print(f"Total records processed: {len(results)}")
-    print(f"Successfully updated: {success_count}")
-    print(f"Skipped (already updated): {skipped_count}")
-    print(f"Failed to update: {failure_count}")
-    
-    # Update the original DataFrame with results
-    results_df = pd.DataFrame(results)
-    if not results_df.empty:
-        # Create a dictionary mapping aspace_uri to update_status
-        update_status_dict = dict(zip(results_df['aspace_uri'], results_df['update_status']))
-        
-        # Update the update_status column in the original dataframe
-        for uri, status in update_status_dict.items():
-            df.loc[df['aspace_uri'] == uri, 'update_status'] = status
-    
-    # Save updated DataFrame
-    df.to_csv(UPDATED_CSV_PATH, index=False, encoding=csv_encoding)
-    logging.info(f"Updated CSV saved to {UPDATED_CSV_PATH}")
-    print(f"Updated CSV saved to {UPDATED_CSV_PATH}")
+    except Exception as e:
+        logging.error(f"Error during ArchivesSpace update process: {str(e)}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

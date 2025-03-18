@@ -1,203 +1,242 @@
 #!/usr/bin/env python3
-
 """
-Update: 03-04-2025
+#author = will nyarko
+#file name = query_snac.py
+#description = Query SNAC API for agent records and cache them
+"""
 
-Updated to use centralized cache and log paths from config.py"""
-
-
-import csv
 import json
-import os
 import time
 import requests
+import logging
+import pandas as pd
+import os
+import sys
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from src.config import SNAC_CACHE_DIR
-from src.config import PROJECT_ROOT
 
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# Configuration paths
 CONFIG_PATH = "config.json"
-CLEANED_CSV_PATH = "src/data/snac_uris_outfile_cleaned.csv"
-CACHE_DIR = SNAC_CACHE_DIR
+MASTER_CSV_PATH = "src/data/master_spreadsheet.csv"
+CACHE_DIR = Path("../aspace-snac-agent-constellation-caches/snac_cache")
 
-ASPACE_ERROR_CSV       = "src/data/aspace_query_errors.csv"
-LOGS_DIR = PROJECT_ROOT / "logs"
-SNAC_QUERY_ERROR_LOG = LOGS_DIR / "snac_query_errors.log"
-SNAC_NOT_FOUND_LOG = LOGS_DIR / "snac_query_not_found.log"
-SNAC_ID_CHANGES_LOG = LOGS_DIR / "snac_id_changes.log"
+# Logging configuration
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOGS_DIR / "snac_query.log"
 
-TEST_MODE = False  # Set to 'False' to process all records after test batch
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Also log to console
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
 
 def load_config(config_path):
+    """Load configuration from JSON file."""
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def log_error(error_message, log_path=SNAC_QUERY_ERROR_LOG):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{error_message}\n")
-
-def log_not_found(msg, log_path=SNAC_NOT_FOUND_LOG):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{msg}\n")
-
-def log_id_change(msg, log_path=SNAC_ID_CHANGES_LOG):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"{msg}\n")
-
-def fetch_snac_record(snac_api_url, ark):
-    request_body = {
+def get_snac_constellation(snac_api_url, snac_ark):
+    """Query the SNAC API for a constellation record."""
+    # Build the API URL for the GET constellation command
+    api_url = f"{snac_api_url}/rest/read/constellation"
+    
+    # Extract the ARK ID from the ARK URL
+    ark_id = snac_ark.split("/")[-1]
+    
+    # Parameters for the API request
+    params = {
         "command": "read",
-        "arkid": ark,
-        "type": "summary"
+        "constellationid": ark_id
     }
     
-    headers = {
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-    }
-
-    # POST instead of GET
-    response = requests.post(snac_api_url, json=request_body, headers=headers)
-    
-    if response.status_code != 200:
-        print(f"DEBUG: {response.status_code} for {ark} - Response: {response.text}")
-        
-    return response
-
-def process_one_record(row, skip_uris, snac_api_url, csv_encoding):
-    aspace_uri = row["uri"].strip()
-    snac_ark   = row["snac_arks"].strip()
-
-    # For the counters
-    result_info = {
-        "cached": False,
-        "fetched": False,
-        "skipped": False,
-        "404": False,
-        "error": False,
-        "merged": False
-    }
-
-    if aspace_uri in skip_uris:
-        result_info["skipped"] = True
-        return result_info
-
-    ark_sanitized = snac_ark.replace(":", "_").replace("/", "_")
-    cache_path = CACHE_DIR / f"{ark_sanitized}.json"
-    if cache_path.exists():
-        result_info["cached"] = True
-        return result_info
-
-    time.sleep(0.1) # Be nice to the server
     try:
-        response = fetch_snac_record(snac_api_url, snac_ark)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("result") == "success-notice":
-                info_type = data.get("message", {}).get("info", {}).get("type")
-                if info_type == "merged":
-                    redirect_target = data["message"]["info"].get("redirect", "UNKNOWN")
-                    log_id_change(f"MERGED: old={snac_ark} -> new={redirect_target}")
-                    result_info["merged"] = True
-
-            with open(cache_path, "w", encoding="utf-8") as outfile:
-                json.dump(data, outfile, indent=2)
-            result_info["fetched"] = True
-
-        elif response.status_code == 404:
-            log_not_found(f"404 for ARK {snac_ark}")
-            result_info["404"] = True
-        else:
-            msg = f"{response.status_code} for ARK {snac_ark}: {response.text}"
-            log_error(msg)
-            result_info["error"] = True
-
+        # Make the API request
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        
+        # Check if we got a redirect (indicating a merged record)
+        if response.history:
+            # There was a redirect, meaning the ARK is merged
+            redirect_url = response.url
+            logging.info(f"Redirect detected for {snac_ark} to {redirect_url}")
+            
+            # Extract the new ARK ID from the redirect URL
+            new_ark_id = redirect_url.split("constellationid=")[-1]
+            new_ark = f"http://n2t.net/ark:/99166/{new_ark_id}"
+            
+            return response.json(), new_ark
+        
+        # No redirect, return the constellation data and original ARK
+        return response.json(), None
+    
     except Exception as e:
-        log_error(f"EXCEPTION for ARK {snac_ark}: {str(e)}")
-        result_info["error"] = True
+        logging.error(f"Error retrieving SNAC constellation for {snac_ark}: {str(e)}")
+        raise
 
-    return result_info
+def cache_snac_record(constellation_data, cache_dir, snac_ark):
+    """Cache SNAC constellation record as JSON file."""
+    # Extract ARK ID for filename
+    ark_id = snac_ark.split("/")[-1]
+    
+    # Create filename
+    filename = f"snac_{ark_id}.json"
+    filepath = cache_dir / filename
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(constellation_data, f, indent=2)
+    
+    return filepath
+
+def query_and_cache_snac(snac_api_url, df, cache_dir, batch_size=50):
+    """Query SNAC API for constellation records and cache them."""
+    # Create cache directory if it doesn't exist
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    total_records = len(df)
+    success_count = 0
+    error_count = 0
+    merge_count = 0
+    
+    # Add columns to track SNAC API query status
+    df['snac_error'] = False
+    df['snac_cache_path'] = None
+    df['snac_ark_merged'] = False
+    df['snac_ark_new'] = None
+    
+    logging.info(f"Starting SNAC query for {total_records} constellation records")
+    
+    # Process in batches to avoid overloading the API
+    for start_idx in range(0, total_records, batch_size):
+        end_idx = min(start_idx + batch_size, total_records)
+        batch_df = df.iloc[start_idx:end_idx].copy()
+        
+        logging.info(f"Processing batch {start_idx//batch_size + 1}: records {start_idx+1}-{end_idx} of {total_records}")
+        
+        for idx, row in batch_df.iterrows():
+            # Find the SNAC ARK to use - check final first, then others
+            snac_ark = None
+            for col in ['snac_ark_final', 'snac_ark', 'snac_ark_old']:
+                if col in row and pd.notna(row[col]) and row[col]:
+                    snac_ark = row[col]
+                    break
+            
+            if not snac_ark:
+                logging.warning(f"No SNAC ARK found for record at index {idx}")
+                df.at[idx, 'snac_error'] = True
+                error_count += 1
+                continue
+            
+            agent_name = row['agent_name']
+            
+            # Extract ARK ID for caching
+            ark_id = snac_ark.split("/")[-1]
+            cache_filename = f"snac_{ark_id}.json"
+            
+            # Skip if the record is already cached
+            if (cache_dir / cache_filename).exists():
+                logging.info(f"Record already cached: {agent_name} ({snac_ark})")
+                df.at[idx, 'snac_cache_path'] = str(cache_dir / cache_filename)
+                success_count += 1
+                continue
+            
+            try:
+                logging.info(f"Querying SNAC for {agent_name} ({snac_ark})")
+                
+                # Get constellation record from SNAC
+                constellation_data, new_ark = get_snac_constellation(snac_api_url, snac_ark)
+                
+                # Handle merged ARKs
+                if new_ark:
+                    logging.info(f"ARK merged: {snac_ark} → {new_ark}")
+                    df.at[idx, 'snac_ark_merged'] = True
+                    df.at[idx, 'snac_ark_new'] = new_ark
+                    merge_count += 1
+                
+                # Cache constellation record
+                cache_path = cache_snac_record(constellation_data, cache_dir, new_ark or snac_ark)
+                
+                # Update dataframe with cache path
+                df.at[idx, 'snac_cache_path'] = str(cache_path)
+                
+                success_count += 1
+                
+                # Add a short delay to avoid overwhelming the API
+                time.sleep(0.2)
+                
+            except Exception as e:
+                logging.error(f"Error processing {agent_name} ({snac_ark}): {str(e)}")
+                df.at[idx, 'snac_error'] = True
+                error_count += 1
+    
+    logging.info(f"SNAC query complete: {success_count} successes, {error_count} errors, {merge_count} merged ARKs")
+    return df
 
 def main():
+    """Main function to query SNAC for constellation records."""
+    # Load configuration
     config = load_config(CONFIG_PATH)
-    snac_base_url = config["credentials"]["snac_api"]["base_url"]
-    csv_encoding = config["settings"]["csv_encoding"]
-    batch_size = config["settings"]["batch_size"]
-
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Build a set of URIs that had errors during run of query_aspace.py so we skip them
-    skip_uris = set()
+    snac_api_url = config["apis"]["snac"]["api_url"]
+    csv_encoding = config["settings"].get("csv_encoding", "utf-8")
+    
+    # Load master spreadsheet
     try:
-        with open(ASPACE_ERROR_CSV, "r", encoding=csv_encoding) as csvfile:
-            error_rows = csv.DictReader(csvfile)
-            
-            # Strip BOM from all headers cos I like to double-click on my CSVs and avoid mojibake
-            error_rows.fieldnames = [name.lstrip("\ufeff") if name else name for name in error_rows.fieldnames]
-            
-            # Debug: Print detected headers after BOM removal
-            # print("Headers in aspace_query_errors.csv:", error_rows.fieldnames)
-
-            for e_row in error_rows:
-                skip_uris.add(e_row["agent_uri"].strip())
-                
-    except FileNotFoundError:
-        print("aspace_query_errors.csv not found.")
-
-    # Load main data
-    with open(CLEANED_CSV_PATH, "r", encoding=csv_encoding) as csvfile:
-        reader = csv.DictReader(csvfile)
+        logging.info(f"Loading master spreadsheet from {MASTER_CSV_PATH}")
+        df = pd.read_csv(MASTER_CSV_PATH, encoding=csv_encoding)
+        logging.info(f"Loaded {len(df)} records from master spreadsheet")
+    except Exception as e:
+        logging.error(f"Error loading master spreadsheet: {str(e)}")
+        return 1
+    
+    # Query and cache SNAC records
+    try:
+        updated_df = query_and_cache_snac(snac_api_url, df, CACHE_DIR)
         
-        # Strip BOM from all headers
-        reader.fieldnames = [name.lstrip("\ufeff") if name else name for name in reader.fieldnames]
+        # Update snac_ark_final column with new ARK if merged
+        mask = updated_df['snac_ark_merged'] == True
+        if 'snac_ark_final' not in updated_df.columns:
+            # Create the column if it doesn't exist
+            updated_df['snac_ark_final'] = None
         
-        # Debug: Print detected headers after BOM removal
-        # print("Headers in snac_uris_outfile_cleaned.csv:", reader.fieldnames)
-
-        rows = list(reader)
-
-    if TEST_MODE:
-        rows = rows[:100]
-
-    total_records = len(rows)
-    counters = {
-        "cached": 0,
-        "fetched": 0,
-        "404": 0,
-        "error": 0,
-        "skipped": 0,
-        "merged": 0
-    }
-
-    print(f"Total SNAC records: {total_records}")
-
-    for i in range(0, total_records, batch_size):
-        batch_rows = rows[i : i + batch_size]
-        batch_start = i + 1
-        batch_end = i + len(batch_rows)
-        print(f"Batch {int(i/batch_size)+1}: Records {batch_start}-{batch_end}")
-
-        futures = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            for row in batch_rows:
-                futures.append(executor.submit(
-                    process_one_record, row, skip_uris, snac_base_url, csv_encoding
-                ))
-
-            for future in as_completed(futures):
-                res = future.result()
-                for key in counters.keys():
-                    if res.get(key):
-                        counters[key] += 1
-
-    print("\nSummary:")
-    print(f" - Total records processed:  {total_records}")
-    print(f" - Already cached:          {counters['cached']}")
-    print(f" - Fetched new:             {counters['fetched']}")
-    print(f" - 404 from SNAC:           {counters['404']}")
-    print(f" - Other errors:            {counters['error']}")
-    print(f" - Skipped (ASpace errs):   {counters['skipped']}")
-    print(f" - Merges noted:            {counters['merged']}")
+        # For each column that might contain the ARK
+        for col in ['snac_ark', 'snac_ark_old', 'snac_ark_final']:
+            if col in updated_df.columns:
+                # Copy non-merged ARKs first
+                updated_df.loc[~mask & updated_df['snac_ark_final'].isna(), 'snac_ark_final'] = updated_df.loc[~mask & updated_df['snac_ark_final'].isna(), col]
+        
+        # Now set merged ARKs to the new value
+        updated_df.loc[mask, 'snac_ark_final'] = updated_df.loc[mask, 'snac_ark_new']
+        
+        # Save updated dataframe with status information
+        logging.info(f"Saving updated master spreadsheet")
+        updated_df.to_csv(MASTER_CSV_PATH, index=False, encoding=csv_encoding)
+        logging.info(f"Updated master spreadsheet saved to {MASTER_CSV_PATH}")
+        
+        # Generate summary statistics
+        total_records = len(updated_df)
+        success_count = (updated_df['snac_error'] == False).sum()
+        error_count = (updated_df['snac_error'] == True).sum()
+        merge_count = (updated_df['snac_ark_merged'] == True).sum()
+        
+        logging.info("\nSummary Statistics:")
+        logging.info(f"Total records processed: {total_records}")
+        logging.info(f"Successfully queried: {success_count} ({success_count/total_records*100:.1f}%)")
+        logging.info(f"Errors: {error_count} ({error_count/total_records*100:.1f}%)")
+        logging.info(f"Merged ARKs detected: {merge_count} ({merge_count/total_records*100:.1f}%)")
+        
+        return 0
+    
+    except Exception as e:
+        logging.error(f"Error during SNAC query process: {str(e)}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
