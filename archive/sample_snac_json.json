@@ -1,0 +1,146 @@
+{
+  "result": "success",
+  "maybesame_count": 0,
+  "constellation": {
+    "dataType": "Constellation",
+    "status": "editable",
+    "ark": "http://n2t.net/ark:/99166/w6b00jh8",
+    "entityType": {
+      "id": "700",
+      "term": "person",
+      "uri": "http://socialarchive.iath.virginia.edu/control/term#Person",
+      "type": "entity_type"
+    },
+    "nameEntries": [
+      {
+        "dataType": "NameEntry",
+        "original": "Hillhouse, Augustus L. (Augustus Lucas), 1791-1859",
+        "preferenceScore": "99",
+        "components": [
+          {
+            "dataType": "NameComponent",
+            "text": "Hillhouse, Augustus L. (Augustus Lucas), 1791-1859",
+            "order": "0",
+            "type": {
+              "id": "400228",
+              "term": "Name",
+              "type": "name_component"
+            },
+            "id": "32144952",
+            "version": "4687988"
+          }
+        ],
+        "id": "32144951",
+        "version": "4687988"
+      },
+      {
+        "dataType": "NameEntry",
+        "original": "Hillhouse, Augustus Lucas, 1791-1859",
+        "preferenceScore": "3",
+        "components": [
+          {
+            "dataType": "NameComponent",
+            "text": "Hillhouse, Augustus Lucas, 1791-1859",
+            "order": "0",
+            "type": {
+              "id": "400228",
+              "term": "Name",
+              "type": "name_component"
+            },
+            "id": "32144958",
+            "version": "4687988"
+          }
+        ],
+        "id": "32144957",
+        "version": "4687988"
+      },
+      {
+        "dataType": "NameEntry",
+        "original": "Hillhouse, Augustus L. 1791-1859",
+        "preferenceScore": "1",
+        "components": [
+          {
+            "dataType": "NameComponent",
+            "text": "Hillhouse, Augustus L. 1791-1859",
+            "order": "0",
+            "type": {
+              "id": "400228",
+              "term": "Name",
+              "type": "name_component"
+            },
+            "id": "32144963",
+            "version": "4687988"
+          }
+        ],
+        "id": "32144962",
+        "version": "4687988"
+      }
+    ],
+    "sameAsRelations": [
+      {
+        "dataType": "SameAs",
+        "type": {
+          "id": "28225",
+          "term": "sameAs",
+          "uri": "http://socialarchive.iath.virginia.edu/control/term#sameAs",
+          "type": "record_type"
+        },
+        "text": "Hillhouse, Augustus L. (Augustus Lucas), 1791-1859",
+        "uri": "https://viaf.org/viaf/5774654",
+        "id": "32144969",
+        "version": "4687988"
+      },
+      {
+        "dataType": "SameAs",
+        "type": {
+          "id": "28225",
+          "term": "sameAs",
+          "uri": "http://socialarchive.iath.virginia.edu/control/term#sameAs",
+          "type": "record_type"
+        },
+        "uri": "https://www.worldcat.org/identities/lccn-n87123695",
+        "id": "32144970",
+        "version": "4687988"
+      },
+      {
+        "dataType": "SameAs",
+        "type": {
+          "id": "28225",
+          "term": "sameAs",
+          "uri": "http://socialarchive.iath.virginia.edu/control/term#sameAs",
+          "type": "record_type"
+        },
+        "uri": "https://id.loc.gov/authorities/n87123695",
+        "id": "32144971",
+        "version": "4687988"
+      }
+    ],
+    "id": "32144944",
+    "version": "4687989",
+    "dates": [
+      {
+        "dataType": "SNACDate",
+        "fromDate": "1791",
+        "fromDateOriginal": "1791",
+        "fromType": {
+          "id": "689",
+          "term": "Birth",
+          "uri": "http://socialarchive.iath.virginia.edu/control/term#Birth",
+          "type": "date_type"
+        },
+        "toDate": "1859",
+        "toDateOriginal": "1859",
+        "toType": {
+          "id": "690",
+          "term": "Death",
+          "uri": "http://socialarchive.iath.virginia.edu/control/term#Death",
+          "type": "date_type"
+        },
+        "isRange": true,
+        "id": "32144945",
+        "version": "4687988"
+      }
+    ]
+  },
+  "timing": 156.33
+}
